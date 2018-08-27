@@ -1,4 +1,47 @@
 # Many derivative free methods of different orders
+#
+# TODO: rework Order5 #https://pdfs.semanticscholar.org/ce50/3210d96f653a14b28da96600d5990d2abe97.pdf
+# https://content.sciendo.com/view/journals/tmj/10/4/article-p103.xml 7 and 8
+# order8: https://www.hindawi.com/journals/ijmms/2012/493456/ref/
+
+
+
+
+## Order0 and 1 are secant type
+function init_state(method::AbstractSecant, fs, x::Number)
+    x1 = float(x)
+    x0 = _default_secant_step(x1)
+    init_state(method, fs, (x0, x1))
+end
+
+
+function init_state(method::AbstractSecant, fs, x::Union{Tuple, Vector})
+    x0, x1 = promote(float(x[1]), float(x[2]))
+    fx0, fx1 = fs(x0), fs(x1)        
+    state = UnivariateZeroState(x1, x0, eltype(x1)[],
+                                fx1, fx0, eltype(fx1)[],
+                                0, 2,
+                                false, false, false, false, "")
+
+    state
+end
+
+
+
+function init_state!(state::UnivariateZeroState{T, S}, method::AbstractSecant, fs, x::Number) where {T, S}
+    x1::T = float(x)
+    x0::T = _default_secant_step(x1)
+    init_state!(state, method, fs, (x0, x1))
+end
+
+
+function init_state!(state::UnivariateZeroState{T, S}, ::AbstractSecant, f, x::Union{Tuple, Vector}) where {T, S}
+    x0,x1 = promote(float.(x)...)
+    fx0, fx1 = promote(f(x0), f(x1))
+    init_state!(state, x1, x0, T[], fx1, fx0, S[])
+    state.fnevals = 2
+    nothing
+end
 
 ##################################################
 
@@ -14,14 +57,27 @@ methods. The implementation roughly follows the algorithm described in
 SOLVE button from the
 [HP-34C](http://www.hpl.hp.com/hpjournal/pdfs/IssuePDFs/1979-12.pdf).
 The basic idea is to use a secant step. If along the way a bracket is
-found, switch to bisection, using `Bisection` if possible, else
-`A42`.  If the secant step fails to decrease the function value, a
-quadratic step is used up to 3 times.
+found, switch to bisection, using `AlefeldPotraShi`.  If the secant
+step fails to decrease the function value, a quadratic step is used up
+to 3 times.
 
 """
 struct Order0 <: AbstractSecant end
 
-""" find_zero(y, 1.8s, order) 
+function find_zero(fs, x0, method::Order0;
+                   tracks::AbstractTracks=NullTracks(),
+                   verbose=false,
+                   kwargs...)
+    M = Order1()
+    N = AlefeldPotraShi()
+    _find_zero(fs, x0, M, N; tracks=tracks,verbose=verbose, kwargs...)
+end
+
+##################################################
+
+## Secant
+## https://en.wikipedia.org/wiki/Secant_method
+""" 
     Order1()
 
 The `Order1()` method is an alias for `Secant`. It specifies the
@@ -35,166 +91,6 @@ evaluation per step and has order `(1+sqrt(5))/2`.
 struct Secant <: AbstractSecant end
 const Order1 = Secant
 
-
-function init_state(method::AbstractSecant, fs, x::Union{Tuple, Vector})
-    x0, x1 = promote(float(x[1]), float(x[2]))
-    fx0, fx1 = fs(x0), fs(x1)        
-    UnivariateZeroState(x1, x0,
-                        missing, #oneunit(x1) * (0*x1)/(0*x1),
-                        
-                        fx1, fx0, 0, 2,
-                        false, false, false, false, "")
-end
-
-function init_state(method::AbstractSecant, fs, x::Number)
-
-    # need an initial x0,x1 if two not specified
-    x1 = float(x)
-    fx1 = fs(x1)
-
-    h = eps(one(real(x1)))^(1/3)
-    dx = h*oneunit(x1) + abs(x1)*h^2 # adjust for if eps(x1) > h
-    x0 = x1 + dx
-    fx0 = fs(x0)
-    
-    UnivariateZeroState(x1, x0,
-                        missing, #oneunit(x1) * (0*x1)/(0*x1),
-                        fx1, fx0, 0, 2,
-                        false, false, false, false, "")
-
-end
-
-function init_state!(state::UnivariateZeroState{T, S}, ::AbstractSecant, f, x::Union{Tuple, Vector}) where {T, S}
-    x0,x1 = promote(float.(x))
-    fx0, fx1 = promote(f(x0), f(x1))
-    init_state!(state, x0, x1, missing, fx0, fx1)
-end
-
-function init_state!(state::UnivariateZeroState{T, S}, ::AbstractSecant, fs, x::Number) where {T, S}
-    x1 = float(x)
-    h = eps(one(real(x1)))^(1/3)
-    dx = h*oneunit(x1) + abs(x1)*h^2 # adjust for if eps(x1) > h
-    x0 = x1 + dx
-    fx0, fx1 = promote(fs(x0), fs(x1))
-    
-    init_state!(state, x0, x1, missing, fx0, fx1)
-end
-##################################################
-
-
-## order 0
-# goal: more robust to initial guess than higher order methods
-# follows roughly algorithm described http://www.hpl.hp.com/hpjournal/pdfs/IssuePDFs/1979-12.pdf, the SOLVE button from the HP-34C
-# though some modifications were made.
-# * use secant step
-# * if along the way a bracket is found, switch to bisection. (We use float64 bisection not a42 if available)
-# * if secant step fails to decrease, we use quadratic step up to 3 times
-#
-# Goal is to return a value `x` with either:
-# * `f(x) == 0.0` or
-# * `f(prevfloat(x)) * f(nextfloat(x)) < 0`.
-# if a bracket is found that can be done, otherwise secant step is used
-
-## in Order0, we run bisection if a bracketing interval is found
-## this is meant to be as speedy as possible
-function _run_bisection(fs, options, state)
-    ## could do hybrid method here, where we update state and options, but
-    ## that proves slower, as bisection64 is more efficient.
-    xn0, xn1 = state.xn0, state.xn1
-    state.xn1 = bisection(fs, xn0, xn1)
-    state.x_converged = true
-    options.strict = true # prevent check on f(xn)
-    state.message *= "Used bisection for last step, evaluation counts are not accurate. "
-end
-
-function update_state(method::Order0, fs, o::UnivariateZeroState{T,S}, options::UnivariateZeroOptions) where {T,S}
-
-    alpha, beta = o.xn0, o.xn1
-    falpha, fbeta = o.fxn0, o.fxn1
-
-    if sign(falpha) * sign(fbeta) < 0.0
-        _run_bisection(fs, options, o)
-        return nothing
-    end
-
-    gamma::T, issue = guarded_secant_step(alpha, beta, falpha, fbeta)
-
-    fgamma::S = fs(gamma); incfn(o)
-
-    if sign(fgamma)*sign(fbeta) < 0.0
-        o.xn0, o.xn1 = gamma, beta
-        o.fxn0, o.fxn1 = fgamma, fbeta
-        _run_bisection(fs, options, o)
-        return nothing
-    end
-
-    if abs(fgamma) <= abs(fbeta)
-        o.xn0, o.xn1 = beta, gamma
-        o.fxn0, o.fxn1 = fbeta, fgamma
-        return nothing
-    end
-
-    ctr = 0
-    while true
-        ## quadratic step
-        ctr += 1
-        if ctr >= 3
-            o.stopped = true
-            o.message = "dithering, algorithm failed to improve using quadratic steps"
-            return nothing
-        end
-
-        # quadratic_step. Put new gamma at vertex of parabola through alpha, beta, (old) gamma
-        gamma = quad_vertex(alpha, falpha, beta, fbeta, gamma, fgamma)
-#        denom = (beta - alpha) * (fbeta - fgamma)  - (beta - fgamma) * (fbeta - falpha)
-#        if isissue(denom)
-        if isissue(gamma)            
-            o.stopped
-            o.message = "dithering, algorithm failed to improve using quadratic steps"
-            return nothing
-        end
-        #        gamma = beta -  ((beta - alpha)^2 * (fbeta - fgamma) - (beta - gamma)^2 * (fbeta - falpha))/denom/2
-
-
-
-        fgamma = fs(gamma); incfn(o)
-        incfn(o)
-
-        if abs(fgamma) < abs(fbeta)
-            o.xn0, o.xn1 = beta, gamma
-            o.fxn0, o.fxn1 = fbeta, fgamma
-            return nothing
-        end
-
-        theta::T, issue = guarded_secant_step(beta, gamma, fbeta, fgamma)
-        
-        ftheta::S = fs(theta); incfn(o)
-
-        if sign(ftheta) * sign(fbeta) < 0
-            o.xn0, o.xn1 = beta, theta
-            o.fxn0, o.fxn1 = fbeta, ftheta
-
-            _run_bisection(fs, options, o)
-            return nothing
-        end
-    end
-
-    # failed to improve
-    o.stopped = true
-    o.message = "failure to improve"
-    return nothing
-end
-
-function show_tracks(l::Tracks, M::Order0)
-    println("Tracks not recorded for Order0()")
-    println("")
-end
-
-##################################################
-
-## Secant
-## https://en.wikipedia.org/wiki/Secant_method
-
 function update_state(method::Secant, fs, o::UnivariateZeroState{T,S}, options)  where {T, S}
 
     if (o.fxn0 == o.fxn1) || (o.xn0 == o.xn1) 
@@ -202,7 +98,7 @@ function update_state(method::Secant, fs, o::UnivariateZeroState{T,S}, options) 
          o.message = "Derivative approximation had issues"
          return
      end
-
+  
     dx = o.fxn1 * (o.xn1 - o.xn0) / (o.fxn1 - o.fxn0)
     o.xn0, o.xn1 = o.xn1, o.xn1 - dx
     o.fxn0, o.fxn1 = o.fxn1, fs(o.xn1)

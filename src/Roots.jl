@@ -4,11 +4,9 @@ module Roots
 
 if VERSION >= v"0.7-"
     using Printf
-else
-    using Missings
 end
 
-using Compat: @nospecialize, lastindex, range
+using Compat: @nospecialize, lastindex, range, Nothing
 
 
 export fzero,

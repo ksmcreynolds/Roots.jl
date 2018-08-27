@@ -29,8 +29,9 @@
 
 ### Methods
 abstract type AbstractUnivariateZeroMethod end
-abstract type AbstractBisection <: AbstractUnivariateZeroMethod end
-abstract type AbstractSecant <: AbstractUnivariateZeroMethod end
+abstract type AbstractBracketing <: AbstractUnivariateZeroMethod end
+abstract type AbstractNonBracketing <: AbstractUnivariateZeroMethod end
+abstract type AbstractSecant <: AbstractNonBracketing end
 
 
 ### States    
@@ -38,30 +39,31 @@ abstract type  AbstractUnivariateZeroState end
 mutable struct UnivariateZeroState{T,S} <: AbstractUnivariateZeroState where {T,S}
     xn1::T
     xn0::T
-    m::Union{T, Missing}
+    m::Vector{T}
     fxn1::S
     fxn0::S
+    fm::Vector{S}
     steps::Int
     fnevals::Int
     stopped::Bool             # stopped, butmay not have converged
     x_converged::Bool         # converged via |x_n - x_{n-1}| < ϵ
     f_converged::Bool         # converged via |f(x_n)| < ϵ
     convergence_failed::Bool
-    message::AbstractString
+    message::String
 end
-incfn(o::UnivariateZeroState, k=1)    = o.fnevals += k
-incsteps(o::UnivariateZeroState, k=1) = o.steps += k
+
+incfn(o::AbstractUnivariateZeroState, k=1)    = o.fnevals += k
+incsteps(o::AbstractUnivariateZeroState, k=1) = o.steps += k
 
 # initialize state for most methods
 function init_state(method::Any, fs, x)
 
     x1 = float(x)
     fx1 = fs(x1); fnevals = 1
-
+    T, S = eltype(x1), eltype(fx1)
     
-    state = UnivariateZeroState(x1, oneunit(x1) * (0*x1)/(0*x1), 
-                                missing, #oneunit(x1) * (0*x1)/(0*x1), 
-                                fx1, oneunit(fx1) * (0*fx1)/(0*fx1), 
+    state = UnivariateZeroState(x1, oneunit(x1) * (0*x1)/(0*x1), T[],
+                                fx1, oneunit(fx1) * (0*fx1)/(0*fx1), S[],
                                 0, fnevals,
                                 false, false, false, false,
                                 "")
@@ -81,12 +83,14 @@ end
 #    out[i] = find_zero(M, f1, options, state)
 # end
 # init_state has a method call variant
-function init_state!(state::UnivariateZeroState{T,S}, x1::T, x0::T, m::Union{T, Missing}, y1::S, y0::S) where {T,S}
+function init_state!(state::UnivariateZeroState{T,S}, x1::T, x0::T, m::Vector{T}, y1::S, y0::S, fm::Vector{S}) where {T,S}
     state.xn1 = x1
     state.xn0 = x0
+    empty!(state.m); append!(state.m,  m)
     state.m = m
     state.fxn1 = y1
     state.fxn0 = y0
+    empty!(state.fm); append!(state.fm,fm)
     state.steps = 0
     state.fnevals = 2
     state.stopped = false
@@ -94,14 +98,45 @@ function init_state!(state::UnivariateZeroState{T,S}, x1::T, x0::T, m::Union{T, 
     state.f_converged = false
     state.convergence_failed = false
     state.message = ""
-    state
+
+    nothing
 end
 
 function init_state!(state::UnivariateZeroState{T,S}, ::AbstractUnivariateZeroMethod, fs, x) where {T, S}
     x1 = float(x)
     fx1 = fs(x1)
-    init_state!(state, x1, oneunit(x1) * (0*x1)/(0*x1), missing, fx1, oneunit(fx1) * (0*fx1)/(0*fx1))
+
+    init_state!(state, x1, oneunit(x1) * (0*x1)/(0*x1), T[],
+                fx1, oneunit(fx1) * (0*fx1)/(0*fx1), S[])
 end
+
+
+function Base.copy(state::UnivariateZeroState{T,S}) where {T, S}
+    UnivariateZeroState(state.xn1, state.xn0, copy(state.m),
+                        state.fxn1, state.fxn0, copy(state.fm),
+                        state.steps, state.fnevals,
+                        state.stopped, state.x_converged,
+                        state.f_converged, state.convergence_failed,
+                        state.message)
+end
+
+function Base.copy!(dst::UnivariateZeroState{T,S}, src::UnivariateZeroState{T,S}) where {T,S}
+    dst.xn1 = src.xn1
+    dst.xn0 = src.xn0
+    empty!(dst.m); append!(dst.m, src.m)
+    dst.fxn1 = src.fxn1
+    dst.fxn0 = src.fxn0
+    empty!(dst.fm); append!(dst.fm, src.fm)
+    dst.steps = src.steps
+    dst.fnevals = src.fnevals
+    dst.stopped = src.stopped
+    dst.x_converged = src.x_converged
+    dst.f_converged = src.f_converged
+    dst.convergence_failed = src.convergence_failed
+    dst.message = src.message
+    nothing
+end
+
 
 ### Options
 mutable struct UnivariateZeroOptions{Q,R,S,T}
@@ -114,37 +149,65 @@ mutable struct UnivariateZeroOptions{Q,R,S,T}
     strict::Bool
 end
 
+"""
+    default_tolerances(Method, [T], [S])
 
-function init_options(::AbstractUnivariateZeroMethod,
+The default tolerances for most methods are `xatol=zero(T)`,
+`xrtol=eps(T)`, `atol=4eps(S)`, and `rtol=4eps(S)`, with the proper
+units (absolute tolerances have the units of `x` and `f(x)`; relative
+tolerances are unitless). For `Complex{T}` values, `T` is used.
+
+The number of iterations is limited by `maxevals=40`, the number of
+function evaluations is not capped, due to `maxfnevals=typemax(Int)`,
+and `strict=false`.
+
+"""
+default_tolerances(M::AbstractUnivariateZeroMethod) = default_tolerances(M, Float64, Float64)
+function default_tolerances(::AbstractUnivariateZeroMethod, ::Type{T}, ::Type{S}) where {T, S}
+    xatol = zero(real(T))
+    xrtol = eps(real(T))  # unitless
+    atol = 4.0 * eps(real(float(S))) * oneunit(real(S))
+    rtol = 4.0 * eps(real(float(S))) * one(real(S))
+    maxevals = 40
+    maxfnevals = typemax(Int)
+    strict = false
+    (xatol, xrtol, atol, rtol, maxevals, maxfnevals, strict)
+end
+                         
+function init_options(M::AbstractUnivariateZeroMethod,
                       state::UnivariateZeroState{T,S};
-                      xatol=missing,
-                      xrtol=missing,
-                      atol=missing,
-                      rtol=missing,
-                      maxevals::Int=40,
-                      maxfnevals::Int=typemax(Int),
-                      strict::Bool=false
+                      kwargs...
                       ) where {T, S}
 
-    ## Where we set defaults
-    x1 = real(oneunit(float(state.xn1)))
-    fx1 = real(oneunit(float(state.fxn1)))
-
-    options = UnivariateZeroOptions(ismissing(xatol) ? zero(x1) : xatol, # units of x
-                                    ismissing(xrtol) ?  eps(x1/oneunit(x1)) : xrtol,  # unitless
-                                    ismissing(atol)  ?  4.0 * eps(fx1) : atol,  # units of f(x)
-                                    ismissing(rtol)  ?  4.0 * eps(fx1/oneunit(fx1)) : rtol, # unitless
-                                    maxevals, maxfnevals, strict)
+    if VERSION < v"0.7.0"
+        d = Dict(kwargs)
+    else
+        d = kwargs
+    end
+    defs = default_tolerances(M, T, S)
+    options = UnivariateZeroOptions(get(d, :xatol, get(d, :xabstol, defs[1])),
+                                    get(d, :xrtol, get(d, :xreltol, defs[2])),
+                                    get(d, :atol,  get(d, :abstol,  defs[3])),
+                                    get(d, :rtol,  get(d, :reltol,  defs[4])),
+                                    get(d, :maxevals,   get(d, :maxsteps, defs[5])),
+                                    get(d, :maxfnevals, defs[6]),
+                                    get(d, :strict,     defs[7]))
     options
 end
 
 # reset options to default values
-function init_options!(options::UnivariateZeroOptions{Q,R,S,T}, ::AbstractUnivariateZeroMethod) where {Q, R, S, T}
-    options.xabstol = zero(Q)
-    options.xreltol = eps(R)
-    options.abstol = 4 * eps(S)
-    options.reltol = 4 * eps(T)
-    options.strict = false
+function init_options!(options::UnivariateZeroOptions{Q,R,S,T}, M::AbstractUnivariateZeroMethod) where {Q, R, S, T}
+
+    defs = default_tolerances(M, Q, S)
+    options.xabstol = defs[1]
+    options.xreltol = defs[2]
+    options.abstol = defs[3]
+    options.reltol = defs[4]
+    options.maxevals = defs[5]
+    options.maxfnevals = defs[6]
+    options.strict = defs[7]
+
+    nothing
 end
 
 
@@ -326,7 +389,7 @@ function assess_convergence(method::Any, state::UnivariateZeroState{T,S}, option
     # stop when xn1 ~ xn.
     # in find_zeros there is a check that f could be a zero with a relaxed tolerance
     if abs(xn1 - xn0) < max(options.xabstol, max(abs(xn1), abs(xn0)) * options.xreltol)
-        state.message = "x_n ≈ x_{n-1}"
+        state.message *= "x_n ≈ x_{n-1}. "
         state.x_converged = true
         return true
     end
@@ -335,12 +398,16 @@ function assess_convergence(method::Any, state::UnivariateZeroState{T,S}, option
     return false
 end
 
-function show_trace(method, state, tracks)
+function show_trace(method, N, state, tracks)
     converged = state.x_converged || state.f_converged
     println("Results of univariate zero finding:\n")
     if converged
         println("* Converged to: $(state.xn1)")
-        println("* Algorithm: $(method)")
+        if N == nothing || isa(method, AbstractBracketing)
+            println("* Algorithm: $(method)")
+        else
+            println("* Algorithm: $(method), with possible bracketing with $N")
+        end
         println("* iterations: $(state.steps)")
         println("* function evaluations: $(state.fnevals)")
         state.x_converged && println("* stopped as x_n ≈ x_{n-1} using atol=xatol, rtol=xrtol")
@@ -381,7 +448,6 @@ A method is specified to indicate which algorithm to employ:
 
 * There are some classical methods where derivatives are required: `Roots.Newton`, `Roots.Halley`. (The are not exported.)
 
-
 For more detail, see the help page for each method (e.g., `?Order1`).
 
 If no method is specified, the default method depends on `x0`:
@@ -408,7 +474,9 @@ optionally `Order5`) a tuple of functions is used.
 * `strict` - if `false` (the default), when the algorithm stops, possible zeros are checked with a relaxed tolerance    
 * `verbose` - if `true` a trace of the algorithm will be shown on successful completion.
 
-See the help string for `Roots.assess_convergence` for details on convergence.
+See the help string for `Roots.assess_convergence` for details on
+convergence. See the help page for `Roots.default_tolerances(method)`
+for details on the default tolerances.
 
 In general, with floating point numbers, convergence must be
 understood as not an absolute statement. Even if mathematically x is
@@ -419,6 +487,8 @@ appreciated, and at times specified.
 For the `Bisection` methods, convergence is guaranteed, so the tolerances are set to be 0 by default.
 
 
+If a bracketing method is passed in after the method specification if a bracket is found, the method will switch. This is what `Order0` does by default, with a secant step initially.
+    
 # Examples:
 
 ```
@@ -447,21 +517,43 @@ find_zero(x->sin(x), 3.0, Order2(), verbose=true)   # 3 iterations
 find_zero(x->sin(x)^5, 3.0, Order2(), verbose=true) # 22 iterations
 ```
 """
-function find_zero(fs, x0, method::AbstractUnivariateZeroMethod;
+function find_zero(fs, x0, method::AbstractUnivariateZeroMethod,
+                   N::Union{Nothing, AbstractBracketing}=nothing;
                    tracks::AbstractTracks=NullTracks(),
                    verbose=false,
                    kwargs...)
 
     F = callable_function(fs)
+
+    _find_zero(F, x0, method, N; tracks=tracks, verbose=verbose, kwargs...)
+end
+
+## This allows for bypassing of `callable_function`.  With
+## callable_function there is no specialization on the function. This
+## makes the first call faster, but subsequent calls slower, due to
+## type instability. Without callable_function the first usage is
+## slower, though this can be effectively reduced using
+## `FunctionWrappers`.
+function _find_zero(F, x0, method::AbstractUnivariateZeroMethod,
+                    N::Union{Nothing, AbstractBracketing}=nothing;
+                    tracks::AbstractTracks=NullTracks(),
+                    verbose=false,
+                    kwargs...)    
+    
+
     state = init_state(method, F, x0)
     options = init_options(method, state; kwargs...)
 
     l = (verbose && isa(tracks, NullTracks)) ? Tracks(eltype(state.xn1)[], eltype(state.fxn1)[]) : tracks
 
-    xstar = find_zero(method, F, options, state, l)
+    if N == nothing  || isa(method, AbstractBracketing)
+        xstar = find_zero(method, F, options, state, l)
+    else
+        xstar = find_zero(method, N, F, options, state, l)
+    end
 
     if verbose
-        show_trace(method, state, l)
+        show_trace(method, N, state, l)
     end
 
     if isnan(xstar)
@@ -482,10 +574,9 @@ find_zero(f, x0::Tuple; kwargs...) = find_zero(f, x0, Bisection(); kwargs...)
 function find_zero(M::AbstractUnivariateZeroMethod,
                    F,
                    options::UnivariateZeroOptions,
-                   state::UnivariateZeroState{T,S},
+                   state::AbstractUnivariateZeroState,
                    l::AbstractTracks=NullTracks()
-                   )  where {T<:Number, S<:Number}
-
+                   )  #where {T<:Number, S<:Number}
 
     log_step(l, M, state, :init)
     
@@ -497,7 +588,11 @@ function find_zero(M::AbstractUnivariateZeroMethod,
         incsteps(state)
     end
 
-    
+    return decide_convergence(M, F, state, options)
+end
+
+# state has stopped, this identifies if it has converged
+function decide_convergence(M::AbstractUnivariateZeroMethod,  F, state, options)
     xn1 = state.xn1
     fxn1 = state.fxn1
     
@@ -511,7 +606,7 @@ function find_zero(M::AbstractUnivariateZeroMethod,
         for u in (prevfloat(xn1), nextfloat(xn1))
             fu = F(u)
             if iszero(fu) || _unitless(fu * fxn1) < 0
-                state.message *= "Change of sign at xn1 identified. "
+                state.message *= "Change of sign at xn identified. "
                 state.f_converged = true
             end
         end
@@ -538,7 +633,7 @@ function find_zero(M::AbstractUnivariateZeroMethod,
         return state.xn1
     end
 
-    nan = oneunit(state.xn1) * (0 * state.xn1) / (0*state.xn1)
+    nan = NaN * state.xn1
     if state.convergence_failed
         return nan        
     end
@@ -546,3 +641,121 @@ function find_zero(M::AbstractUnivariateZeroMethod,
 
 end
 
+
+# Switch to bracketing method
+#M = Bisection()  # exact for floating point
+#M = AlefeldPotraShi() # *usually* exact
+#M = Brent()          # a bit faster, but not always convergent, as implemented (cf. RootTesting)
+run_bisection(f, xs, state, options) = run_bisection(AlefeldPotraShi(), f, xs, state, options)
+function run_bisection(N::AbstractBracketing, f, xs, state, options)
+    steps, fnevals = state.steps, state.fnevals
+    init_state!(state, N, f, xs)
+    state.steps += steps
+    state.fnevals += fnevals # could avoid 2 fn calls, with fxs
+    init_options!(options, N)
+    find_zero(N, f, options, state)
+    a, b = xs
+    u,v = a > b ? (b, a) : (a, b)
+    state.message *= "Bracketing used over ($u, $v), those steps not shown. "
+    return nothing
+end
+
+
+# Robust version using some tricks: idea from algorithm described in
+# [The SOLVE button from the
+# HP-34]C(http://www.hpl.hp.com/hpjournal/pdfs/IssuePDFs/1979-12.pdf).
+# * use bracketing method if one identifed
+# * limit steps so as not too far or too near the previous one
+# * if not decreasing, use a quad step upto 4 times to bounce out of trap, if possible
+# First uses M, then N if bracket is identified
+function find_zero(M::AbstractUnivariateZeroMethod,
+                   N::AbstractBracketing,
+                   F,
+                   options::UnivariateZeroOptions,
+                   state::AbstractUnivariateZeroState,
+                   l::AbstractTracks=NullTracks()
+                   )
+
+    
+    log_step(l, M, state, :init)
+    state0 = copy(state)
+    quad_ctr = 0
+
+    while true
+
+        if assess_convergence(M, state, options)
+            break
+        end
+
+        copy!(state0, state)
+        update_state(M, F, state0, options) # state0 is proposed step
+
+        ## did we find a zero or a bracketing interval?
+        if iszero(state0.fxn1)
+            copy!(state, state0)
+            state.f_converged = true
+            break
+        elseif sign(state0.fxn0) * sign(state0.fxn1) < 0
+            copy!(state, state0)
+            a, b = state0.xn0, state0.xn1 # could save some fn calls here
+            run_bisection(N, F, (a, b), state, options)
+            break
+        end
+            
+            
+        ## did we move too far?
+        r, a, b = state0.xn1, state.xn0, state.xn1
+        Δr = abs(r - b)
+        Δx = abs(b - a)
+        ts,TB = 1e-3, 1e2 # too small, too big
+        if  Δr >= TB * Δx
+            r = b + sign(r-b) * TB * Δx  ## too big
+            state0.xn1 = r
+            state0.fxn1 = F(r)
+            incfn(state)
+        elseif Δr <= ts * Δx
+            r = b + sign(r - b) * ts * Δx
+            state0.xn1 = r
+            state0.fxn1 = F(r)
+            incfn(state)
+        end
+
+        ## did we improve?
+        if abs(state0.fxn1) < abs(state.fxn1)
+            # check
+            if isnan(state0.xn1) || isnan(state0.fxn1) || isinf(state0.xn1) || isinf(state0.fxn1)
+                break
+            end
+            copy!(state, state0)
+            log_step(l, M, state)
+            incsteps(state)
+            quad_ctr = 0
+            continue
+        end
+
+        ## try quad_vertex, unless that has gotten old
+        if quad_ctr > 4
+            copy!(state, state0)
+            state.stopped = true
+            break
+        else
+            quad_ctr += 1
+            r = Roots.quad_vertex(state0.xn1, state0.fxn1, state.xn1, state.fxn1, state.xn0, state.fxn0)
+            if isnan(r) || isinf(r)
+                copy!(state, state0)
+            else
+                state0.xn1 = r
+                state0.fxn1 = F(r)
+                incfn(state)
+                copy!(state, state0)
+            end
+        end
+
+        log_step(l, M, state)
+        incsteps(state)
+    end
+    
+    decide_convergence(M, F, state, options)
+end
+
+    
